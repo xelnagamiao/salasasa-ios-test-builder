@@ -1,0 +1,109 @@
+name: Build unsigned iOS from a draft export
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing draft release tag in this repository
+        required: true
+        type: string
+      xcode_zip:
+        description: Exact ZIP asset filename in that draft release
+        required: true
+        type: string
+      sha256:
+        description: SHA-256 of the uploaded Xcode ZIP
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unsigned-ios-xcode
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Change only after checking the actual export and runner image.
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      XCODE_ZIP: ${{ inputs.xcode_zip }}
+      INPUT_SHA256: ${{ inputs.sha256 }}
+    steps:
+      - name: Check out the build scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check build environment
+        run: |
+          set -euo pipefail
+          test -d "$DEVELOPER_DIR"
+          test -f scripts/xcode-only.sh
+          test -f scripts/ios_artifact.py
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          python3 --version
+          gh --version
+          df -h "$RUNNER_TEMP"
+
+      - name: Download the verified draft input
+        id: download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/draft_assets.py download \
+            --tag "$RELEASE_TAG" --filename "$XCODE_ZIP" --sha256 "$INPUT_SHA256" \
+            --destination "$RUNNER_TEMP/ios-input.zip" \
+            --state "$RUNNER_TEMP/ios-release-state.json"
+
+      - name: Extract the Xcode project safely
+        id: extract
+        run: |
+          set -euo pipefail
+          python3 scripts/safe_xcode_archive.py \
+            --archive "$RUNNER_TEMP/ios-input.zip" --sha256 "$INPUT_SHA256" \
+            --destination "$RUNNER_TEMP/ios-xcode" --github-output "$GITHUB_OUTPUT"
+
+      - name: Build the unsigned device IPA
+        id: compile
+        env:
+          XCODE_PROJECT_DIR: ${{ steps.extract.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ios-output"
+          # Xcode can print source fragments. Keep its complete log in the draft,
+          # not in this public repository's Actions log. No GH_TOKEN is passed.
+          set +e
+          bash scripts/xcode-only.sh \
+            --export-path "$XCODE_PROJECT_DIR" --output "$RUNNER_TEMP/ios-output" \
+            > "$RUNNER_TEMP/ios-output/driver.log" 2>&1
+          result=$?
+          set -e
+          if [ "$result" -ne 0 ]; then
+            echo '::error::Xcode build failed. Download the diagnostic ZIP from the existing draft release.'
+          else
+            echo 'Unsigned IPA built. It still requires device-specific signing before installation.'
+          fi
+          exit "$result"
+
+      - name: Save results to the existing draft only
+        if: ${{ always() && steps.download.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_SUCCEEDED: ${{ steps.compile.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 scripts/draft_assets.py upload \
+            --state "$RUNNER_TEMP/ios-release-state.json" \
+            --output "$RUNNER_TEMP/ios-output" \
+            --build-succeeded "$BUILD_SUCCEEDED" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
