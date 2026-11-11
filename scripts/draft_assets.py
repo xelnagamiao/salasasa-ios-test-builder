@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -57,26 +58,81 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def require_anonymous_404(endpoint):
-    request = urllib.request.Request(API + endpoint, headers={
-        "Accept": "application/vnd.github+json", "User-Agent": "ios-draft-visibility-check",
-        "X-GitHub-Api-Version": "2022-11-28",
-    })
+def anonymous_status(url, is_api=True):
+    headers = {"Accept": "application/vnd.github+json" if is_api else "text/html",
+               "User-Agent": "ios-draft-visibility-check"}
+    if is_api:
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+    request = urllib.request.Request(url, headers=headers)
+    body = b""
     try:
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
             status = response.status
+            response_headers = response.headers
     except urllib.error.HTTPError as exc:
         status = exc.code
-        exc.close()
-    if status != 404:
-        raise ValueError("Anonymous draft visibility could not be verified (expected HTTP 404)")
+        response_headers = exc.headers or {}
+        try:
+            if status in (403, 429) and exc.fp is not None:
+                body = exc.read(2048)
+        finally:
+            exc.close()
+    if status == 429:
+        category = "rate-limit"
+    elif status == 403 and response_headers.get("X-RateLimit-Remaining") == "0":
+        category = "primary-rate-limit"
+    elif status == 403 and response_headers.get("Retry-After") is not None:
+        category = "secondary-rate-limit"
+    elif status == 403 and b"rate limit" in body.lower():
+        category = "rate-limit-response"
+    elif status == 403:
+        category = "forbidden; rate limit not confirmed"
+    elif status == 404:
+        category = "not-found"
+    elif 300 <= status < 400:
+        category = "redirect-refused"
+    else:
+        category = "unexpected-response"
+    return status, category
+
+
+def github_fallback_url(url, repo):
+    if not isinstance(url, str) or not isinstance(repo, str):
+        raise ValueError("GitHub API did not provide a usable fallback visibility URL")
+    parsed = urllib.parse.urlsplit(url)
+    path = urllib.parse.unquote(parsed.path)
+    if (parsed.scheme != "https" or parsed.netloc != "github.com" or parsed.query or parsed.fragment
+            or not path.casefold().startswith(f"/{repo}/releases/".casefold())
+            or "\\" in path or any(part in (".", "..") for part in path.split("/"))
+            or any(ord(ch) < 32 for ch in url + path)):
+        raise ValueError("Refusing fallback URL outside this repository's HTTPS GitHub release pages")
+    return url
+
+
+def require_anonymous_404(endpoint, fallback_url=None, repo=None):
+    status, category = anonymous_status(API + endpoint)
+    if status == 404:
+        return
+    if status in (403, 429) and "rate-limit" in category:
+        print(f"Anonymous API check: HTTP {status} ({category}); checking GitHub web visibility.")
+        url = github_fallback_url(fallback_url, repo)
+        web_status, web_category = anonymous_status(url, is_api=False)
+        if web_status == 404:
+            print("Anonymous GitHub web check: HTTP 404 (not-found).")
+            return
+        raise ValueError(f"Anonymous GitHub web visibility check returned HTTP {web_status} "
+                         f"({web_category}); expected HTTP 404 after API HTTP {status} ({category})")
+    raise ValueError(f"Anonymous draft visibility check returned HTTP {status} ({category}); expected HTTP 404")
 
 
 def check_private_draft(repo, release_id, tag, asset_id=None):
     release = ensure_draft(api(f"repos/{repo}/releases/{release_id}"), tag)
-    require_anonymous_404(f"/repos/{repo}/releases/{release_id}")
+    require_anonymous_404(f"/repos/{repo}/releases/{release_id}", release.get("html_url"), repo)
     if asset_id is not None:
-        require_anonymous_404(f"/repos/{repo}/releases/assets/{asset_id}")
+        asset = api(f"repos/{repo}/releases/assets/{asset_id}")
+        if asset.get("id") != asset_id:
+            raise ValueError("GitHub asset identity changed during the draft visibility check")
+        require_anonymous_404(f"/repos/{repo}/releases/assets/{asset_id}", asset.get("browser_download_url"), repo)
     return release
 
 
@@ -198,7 +254,7 @@ def upload(args):
             raise ValueError("Could not verify all uploaded draft outputs")
         if asset.get("digest") not in (None, "", "sha256:" + file_digest(path)):
             raise ValueError("An uploaded draft output failed its digest check")
-        require_anonymous_404(f"/repos/{repo}/releases/assets/{asset['id']}")
+        require_anonymous_404(f"/repos/{repo}/releases/assets/{asset['id']}", asset.get("browser_download_url"), repo)
     print(f"Saved {len(files)} outputs to the existing draft. Nothing was published.")
 
 
