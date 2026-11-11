@@ -82,10 +82,21 @@ jobs:
           mkdir -p "$RUNNER_TEMP/ios-output"
           # Xcode can print source fragments. Keep its complete log in the draft,
           # not in this public repository's Actions log. No GH_TOKEN is passed.
+          started_seconds=$SECONDS
           set +e
           bash scripts/xcode-only.sh \
             --export-path "$XCODE_PROJECT_DIR" --output "$RUNNER_TEMP/ios-output" \
-            > "$RUNNER_TEMP/ios-output/driver.log" 2>&1
+            > "$RUNNER_TEMP/ios-output/driver.log" 2>&1 &
+          build_pid=$!
+          while kill -0 "$build_pid" 2>/dev/null; do
+            sleep 30
+            if kill -0 "$build_pid" 2>/dev/null; then
+              elapsed_seconds=$((SECONDS - started_seconds))
+              log_bytes=$(wc -c < "$RUNNER_TEMP/ios-output/driver.log")
+              printf 'Build in progress: elapsed=%ss, private log bytes=%s\n' "$elapsed_seconds" "$log_bytes"
+            fi
+          done
+          wait "$build_pid"
           result=$?
           set -e
           if [ "$result" -ne 0 ]; then
