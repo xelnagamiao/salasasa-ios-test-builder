@@ -4,6 +4,7 @@ import hashlib
 import json
 import pathlib
 import plistlib
+import re
 import struct
 import sys
 import zipfile
@@ -41,9 +42,21 @@ def validate_export(root):
             raise ValueError('Export receipt mismatch: ' + key)
     if result.get('scene') != 'Assets/Scenes/MainScene.unity':
         raise ValueError('Unexpected build scene')
-    if not (root / 'Unity-iPhone.xcodeproj/project.pbxproj').is_file():
+    project = root / 'Unity-iPhone.xcodeproj/project.pbxproj'
+    if not project.is_file():
         raise ValueError('Xcode project missing')
-    validate_plist(plistlib.loads((root / 'Info.plist').read_bytes()), platform=False)
+    info = plistlib.loads((root / 'Info.plist').read_bytes())
+    if info.get('CFBundleIdentifier') in ('${PRODUCT_BUNDLE_IDENTIFIER}', '$(PRODUCT_BUNDLE_IDENTIFIER)'):
+        # Unity's source plist intentionally leaves this for Xcode substitution.
+        # The successful C# receipt above records the exact iOS PlayerSettings ID;
+        # also require a matching literal build setting in this exported project.
+        # This substitution is in memory only and never applies to final app/IPA checks.
+        bundle = re.escape(result['bundleId'])
+        setting = r'(?m)^[ \t]*PRODUCT_BUNDLE_IDENTIFIER[ \t]*=[ \t]*(?:"' + bundle + r'"|' + bundle + r')[ \t]*;'
+        if not re.search(setting, project.read_text(encoding='utf-8-sig')):
+            raise ValueError('Export bundle-ID placeholder lacks matching project setting')
+        info['CFBundleIdentifier'] = result['bundleId']
+    validate_plist(info, platform=False)
     return result
 
 
